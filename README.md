@@ -1,5 +1,6 @@
 # agent-lab
 [![CI](https://github.com/timo2553/agent-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/timo2553/agent-lab/actions/workflows/ci.yml)
+
 从零实现的电商客服 Agent 工程练习。不用 LangChain / LangGraph 这类编排框架，把
 **会话落盘 → 上下文构建 → 检索 → 工具调用 → 工作流与人工审批 → 可观测** 这条链路自己写一遍，
 每一步都留下测试和取舍记录。课程仓只作为需求参考，本仓代码全部自己实现。
