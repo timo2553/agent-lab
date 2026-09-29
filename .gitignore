@@ -1,0 +1,23 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 本地数据
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite3
+*.jsonl
+
+# 密钥
+.env
+course.env
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

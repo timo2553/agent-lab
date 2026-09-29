@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-lab"
+version = "0.1.0"
+description = "从零实现的电商客服 Agent：会话落盘、上下文构建、检索、工具调用、工作流与人工审批"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "提莫", email = "1257176602@qq.com" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.4"]
+
+[tool.setuptools]
+packages = ["agent_lab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
