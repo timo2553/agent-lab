@@ -15,8 +15,11 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest==8.3.4"]
 
-[tool.setuptools]
-packages = ["agent_lab"]
+[project.scripts]
+agent-lab = "agent_lab.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agent_lab*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

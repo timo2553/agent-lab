@@ -16,6 +16,9 @@ __pycache__/
 .env
 course.env
 
+# 练习参考答案（只留在本地，不推送到 GitHub）
+reference/
+
 # 编辑器 / 系统
 .DS_Store
 Thumbs.db

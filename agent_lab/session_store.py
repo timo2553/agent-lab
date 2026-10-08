@@ -14,7 +14,8 @@ import threading
 import uuid
 from pathlib import Path
 
-from agent_lab.models import Message
+from agent_lab.llm.types import Usage
+from agent_lab.models import STATUS_OK, Message, UsageRecord, utc_now
 
 # 建表 + 切 WAL 是"一次性独占"操作：切换 journal_mode 时 SQLite 不走 busy 等待，
 # 并发初始化会直接抛 database is locked，所以进程内用一把锁串行化。
@@ -45,7 +46,7 @@ class SessionStore:
         return conn
 
     def __init__db(self) -> None:
-        """初始化数据库。"""
+        """初始化数据库：建表、切 WAL、给老库补列。"""
         with _INIT_LOCK:
             conn = self.__connect_db()
             try:
@@ -59,33 +60,67 @@ class SessionStore:
                     session_id      TEXT NOT NULL,
                     role            TEXT NOT NULL,
                     content         TEXT NOT NULL,
-                    created_at      TEXT NOT NULL
+                    created_at      TEXT NOT NULL,
+                    status          TEXT NOT NULL DEFAULT 'ok'
                     )
                     """
                 )
+                # token 用量单独一张表。它是"每次调用"的事实，不是"每条消息"的属性：
+                # 一次调用既有输入用量又有输出用量，挂在 message 上会出现两个真相来源。
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS usage_log(
+                    seq                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id          TEXT NOT NULL,
+                    model               TEXT NOT NULL,
+                    prompt_tokens       INTEGER NOT NULL,
+                    completion_tokens   INTEGER NOT NULL,
+                    created_at          TEXT NOT NULL
+                    )
+                    """
+                )
+                self.__migrate(conn)
                 conn.commit()
             finally:
                 conn.close()
 
-    def append_message(self, session_id: str, role: str, content: str) -> Message:
+    def __migrate(self, conn: sqlite3.Connection) -> None:
+        """给 M0 时期建的老库补上 status 列。
+
+        CREATE TABLE IF NOT EXISTS 不会改动已存在的表，所以加字段必须显式迁移，
+        否则老库上跑新代码会直接报 no such column。
+        """
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+        if "status" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'")
+
+    def append_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        status: str = STATUS_OK,
+    ) -> Message:
         msg = Message(
             message_id=uuid.uuid4().hex,
             session_id=session_id,
             role=role,
             content=content,
+            status=status,
         )
         conn = self.__connect_db()
         try:
             conn.execute(
                 "INSERT INTO messages"
-                "(message_id, session_id, role, content, created_at)"
-                "VALUES (?, ?, ?, ?, ?)",
+                "(message_id, session_id, role, content, created_at, status)"
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     msg.message_id,
                     msg.session_id,
                     msg.role,
                     msg.content,
                     msg.created_at,
+                    msg.status,
                 ),
             )
             conn.commit()
@@ -93,22 +128,43 @@ class SessionStore:
             conn.close()
         return msg
 
-    def load_history(self, session_id: str, limit: int = 20) -> list[Message]:
+    def mark_message_status(self, message_id: str, status: str) -> None:
+        """回写一条消息的状态，例如调用失败后把用户输入标成 failed。"""
+        conn = self.__connect_db()
+        try:
+            conn.execute("UPDATE messages SET status=? WHERE message_id=?", (status, message_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_history(
+        self,
+        session_id: str,
+        limit: int = 20,
+        *,
+        status: str | None = None,
+    ) -> list[Message]:
         """按时间正序返回该会话最近的 limit 条消息。
 
         语义（测试按这个来，别改）：
         - 只取最近的 limit 条，但返回值仍按时间正序排列（旧 -> 新）
         - 会话不存在、或没有任何消息时，返回空列表，不要抛异常
+        - status 传具体值时只返回该状态的消息；组 prompt 时传 "ok"，
+          把"没得到回复的失败输入"挡在上下文之外
         """
         if limit <= 0:
             return []
+        sql = "SELECT message_id, role, content, created_at, status FROM messages "
+        params: list[object] = [session_id]
+        if status is None:
+            sql += "WHERE session_id=? ORDER BY seq DESC LIMIT ?"
+            params.append(limit)
+        else:
+            sql += "WHERE session_id=? AND status=? ORDER BY seq DESC LIMIT ?"
+            params.extend([status, limit])
         conn = self.__connect_db()
         try:
-            rows = conn.execute(
-                "SELECT message_id, role, content, created_at FROM messages "
-                "WHERE session_id=? ORDER BY seq DESC LIMIT ?",
-                (session_id, limit),
-            ).fetchall()
+            rows = conn.execute(sql, tuple(params)).fetchall()
         finally:
             conn.close()
         rows.reverse()
@@ -119,16 +175,13 @@ class SessionStore:
                 role=r["role"],
                 content=r["content"],
                 created_at=r["created_at"],
+                status=r["status"],
             )
             for r in rows
         ]
 
     def delete_session(self, session_id: str) -> None:
-        """删除该会话的全部消息，不影响其他会话。
-
-        语义（测试按这个来，别改）：
-        - 删除不存在的会话不是错误，静默返回即可
-        """
+        """删除该会话的全部消息，不影响其他会话。"""
         conn = self.__connect_db()
         try:
             conn.execute(
@@ -139,3 +192,52 @@ class SessionStore:
             conn.commit()
         finally:
             conn.close()
+
+    def record_usage(self, session_id: str, model: str, usage: Usage) -> None:
+        """记录一次模型调用的用量（落库，重启后统计仍可查）。"""
+        conn = self.__connect_db()
+        try:
+            conn.execute(
+                "INSERT INTO usage_log"
+                "(session_id, model, prompt_tokens, completion_tokens, created_at)"
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    model,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    utc_now(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_usage(self, session_id: str | None = None) -> list[UsageRecord]:
+        """读出用量记录；session_id 传 None 表示全部会话。"""
+        sql = (
+            "SELECT session_id, model, prompt_tokens, completion_tokens, created_at "
+            "FROM usage_log "
+        )
+        params: tuple[object, ...] = ()
+        if session_id is not None:
+            sql += "WHERE session_id=? "
+            params = (session_id,)
+        sql += "ORDER BY seq"
+        conn = self.__connect_db()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+        return [
+            UsageRecord(
+                session_id=r["session_id"],
+                model=r["model"],
+                usage=Usage(
+                    prompt_tokens=r["prompt_tokens"],
+                    completion_tokens=r["completion_tokens"],
+                ),
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
