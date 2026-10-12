@@ -9,7 +9,7 @@ description = "从零实现的电商客服 Agent：会话落盘、上下文构�
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "提莫", email = "1257176602@qq.com" }]
+authors = [{ name = "提莫", email = "19558238748@163.com" }]
 dependencies = []
 
 [project.optional-dependencies]
@@ -20,6 +20,10 @@ agent-lab = "agent_lab.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["agent_lab*"]
+
+# 模板是 .txt 数据文件，不声明的话打 wheel 时会丢
+[tool.setuptools.package-data]
+"agent_lab.prompts" = ["templates/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
