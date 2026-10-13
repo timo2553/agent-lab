@@ -19,6 +19,7 @@ from agent_lab.cost import BudgetExceededError, format_usage, summarize
 from agent_lab.llm.client import LLMClient, OpenAICompatClient
 from agent_lab.llm.errors import LLMError
 from agent_lab.llm.fake import FakeLLMClient
+from agent_lab.rag import Retriever, build_default_retriever
 from agent_lab.session_store import SessionStore
 
 DEFAULT_DB = "data/sessions.db"
@@ -101,12 +102,19 @@ def _build_service(args: argparse.Namespace) -> ChatService:
         client,
         history_limit=args.limit,
         budget_tokens=args.budget,
+        retriever=build_default_retriever(),
     )
+
+
+def _print_reply(reply) -> None:
+    print(reply.text)
+    if reply.sources:
+        print(f"      [来源] {Retriever.format_sources(reply.sources)}")
 
 
 def _cmd_ask(service: ChatService, args: argparse.Namespace) -> int:
     reply = service.ask(args.session, args.text)
-    print(reply.text)
+    _print_reply(reply)
     usage, cost = service.session_usage(args.session)
     print(f"[本次] total={reply.usage.total_tokens} tokens")
     print(f"[会话累计] {format_usage(usage, cost)}")
@@ -135,6 +143,8 @@ def _cmd_chat(service: ChatService, args: argparse.Namespace) -> int:
             print(f"[预算熔断] {exc}", file=sys.stderr)
             return 3
         print(f"客服> {reply.text}")
+        if reply.sources:
+            print(f"      [来源] {Retriever.format_sources(reply.sources)}")
         usage, cost = service.session_usage(args.session)
         print(f"       [会话累计 {format_usage(usage, cost)}]")
 

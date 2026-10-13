@@ -10,7 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "提莫", email = "19558238748@163.com" }]
-dependencies = []
+# 唯一一个运行时第三方依赖：中文检索要分词（取舍见 README 设计决策 11）。
+# 除它之外，传输层、存储、检索算法全部走标准库 / 自研。
+dependencies = ["jieba==0.42.1"]
 
 [project.optional-dependencies]
 dev = ["pytest==8.3.4"]
@@ -21,9 +23,10 @@ agent-lab = "agent_lab.cli:main"
 [tool.setuptools.packages.find]
 include = ["agent_lab*"]
 
-# 模板是 .txt 数据文件，不声明的话打 wheel 时会丢
+# 模板与语料都是数据文件，不声明的话打 wheel 时会丢
 [tool.setuptools.package-data]
 "agent_lab.prompts" = ["templates/*.txt"]
+"agent_lab.rag" = ["corpus/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

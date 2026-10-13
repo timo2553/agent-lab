@@ -1,12 +1,12 @@
 """最小对话闭环：把会话存储（M0）与模型客户端（M1）接起来。
 
-一轮 ask() 的顺序是固定的：查预算 -> 越界判定 -> 读历史 -> 组 prompt
+一轮 ask() 的顺序是固定的：查预算 -> 越界判定 -> 检索 -> 读历史 -> 组 prompt
 -> 落库用户输入 -> 调模型 -> 落库回复 -> 记用量。
 
 三个刻意的选择：
 - 用户输入**先落库再调用**：调用失败时输入不会丢，只是标成 failed。
 - 系统提示词**不落库**：它属于配置，不属于用户对话历史，每次请求时注入。
-- 越界判定放在**主模型之前**：判越界就直接回绝，主模型一次都不调。
+- 越界判定与检索都放在**主模型之前**：判越界、或检索低分，就直接回绝，主模型一次都不调。
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from agent_lab.llm.errors import LLMError
 from agent_lab.llm.types import Usage
 from agent_lab.models import STATUS_FAILED, STATUS_OK, Message
 from agent_lab.prompts import PromptRegistry
+from agent_lab.rag.retriever import Citation, Retriever
 from agent_lab.routing import IntentResult
 from agent_lab.session_store import SessionStore
 
@@ -49,6 +50,9 @@ class Reply:
     failed: bool = False
     out_of_scope: bool = False
     intent: str | None = None
+    # 命中知识库时回填的引用（marker 对应回答里的 [1][2]）；低分兜底时为空
+    sources: tuple[Citation, ...] = ()
+    rag_fallback: bool = False
 
 
 class ChatService:
@@ -66,6 +70,7 @@ class ChatService:
         guard: IntentGuard | None = None,
         out_of_scope_text: str | Callable[[str], str] | None = None,
         shop_name: str = "本店",
+        retriever: Retriever | None = None,
     ) -> None:
         self.store = store
         self.client = client
@@ -76,6 +81,8 @@ class ChatService:
         self.guard = guard
         self.out_of_scope_text = out_of_scope_text
         self.shop_name = shop_name
+        # 注入检索器才启用 RAG；不注入就退化成 M2 的纯对话（历史 + 越界判定）
+        self.retriever = retriever
 
     def ask(self, session_id: str, text: str) -> Reply:
         """问一轮，返回这轮的回复与用量；调用失败会抛 LLMError 并留下失败记录。"""
@@ -87,9 +94,22 @@ class ChatService:
             if not result.in_scope:
                 return self.__out_of_scope(session_id, text, result)
 
+        # 检索发生在任何模型调用之前：低分就直接兜底拒答，主模型一次都不调。
+        citations: tuple[Citation, ...] = ()
+        context_message: Message | None = None
+        if self.retriever is not None:
+            retrieved = self.retriever.retrieve(text)
+            if not retrieved.confident:
+                return self.__rag_fallback(session_id, text)
+            citations = retrieved.citations
+            context_message = self.__context_message(session_id, citations)
+
         history = self.store.load_history(session_id, limit=self.history_limit, status=STATUS_OK)
         user_message = self.store.append_message(session_id, "user", text)
-        prompt = [self.__system_message(session_id), *history, user_message]
+        prompt = [self.__system_message(session_id)]
+        if context_message is not None:
+            prompt.append(context_message)
+        prompt.extend([*history, user_message])
         try:
             response = self.client.complete(prompt)
         except LLMError:
@@ -105,6 +125,7 @@ class ChatService:
             usage=response.usage,
             user_message=user_message,
             assistant_message=assistant_message,
+            sources=citations,
         )
 
     def session_usage(self, session_id: str) -> tuple[Usage, float | None]:
@@ -136,6 +157,44 @@ class ChatService:
             failed=True,
             out_of_scope=True,
             intent=result.intent,
+        )
+
+    def __context_message(
+        self, session_id: str, citations: tuple[Citation, ...]
+    ) -> Message:
+        """把检索到的引用拼成一条 system 消息，注入 prompt。
+
+        放到 system 而不是 user：它属于"给模型的参考资料"，不是用户说的内容；
+        而且它每轮都重新检索、不落库，保持历史干净。
+        """
+        context = Retriever.format_context(citations)
+        content = (
+            "下面是知识库里检索到的参考资料，请优先依据它们回答，"
+            "并用 [编号] 标注引用来源：\n\n"
+            f"{context}"
+        )
+        return Message(
+            message_id=f"context:{session_id}",
+            session_id=session_id,
+            role="system",
+            content=content,
+        )
+
+    def __rag_fallback(self, session_id: str, text: str) -> Reply:
+        """低分兜底：知识库里没有依据，主模型一次不调，回固定话术并标 failed。"""
+        user_message = self.store.append_message(session_id, "user", text)
+        self.store.mark_message_status(user_message.message_id, STATUS_FAILED)
+        reply_text = self.registry.render("rag_no_answer_reply", shop_name=self.shop_name)
+        assistant = self.store.append_message(session_id, "assistant", reply_text)
+        self.store.mark_message_status(assistant.message_id, STATUS_FAILED)
+        return Reply(
+            session_id=session_id,
+            text=reply_text,
+            usage=Usage(),
+            user_message=user_message,
+            assistant_message=assistant,
+            failed=True,
+            rag_fallback=True,
         )
 
     def __resolve_out_of_scope_text(self) -> str:
